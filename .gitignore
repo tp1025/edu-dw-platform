@@ -1,0 +1,34 @@
+# ===== 数据与临时文件 =====
+*.tsv
+*.csv
+*.zip
+*.log
+tmp/
+exp/
+exp2/
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ===== 系统与编辑器 =====
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# ===== 本地配置（含密码，绝不提交）=====
+.env
+*.local
+config.local.*
+
+# ===== 大文件与二进制产物 =====
+*.tar
+*.tar.gz
+*.7z
+*.rar
