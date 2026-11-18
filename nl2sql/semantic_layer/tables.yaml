@@ -1,0 +1,301 @@
+# =====================================================================
+# 语义层（Semantic Layer）—— 给 LLM 看的"数据库说明书"
+#
+# 与 SHOW CREATE TABLE 的区别：
+#   1. 写清字段的业务含义（不只是列名）
+#   2. 写清【口径】：同一个"平均分"可能有两个口径
+#   3. 写清【枚举值】：term_id=202601 到底是哪个学期
+#   4. 写清【使用边界】：这张表能回答什么、不能回答什么
+#
+# 这是 Text2SQL 准确率的关键——模型幻觉的主因是缺少业务语义。
+# =====================================================================
+
+version: 1
+database: edu_dw
+dialect: mysql
+
+# ---------------------------------------------------------------------
+# 全局约定
+# ---------------------------------------------------------------------
+global:
+  term_encoding:
+    202501: 2024-2025学年第二学期（春）
+    202502: 2025-2026学年第一学期（秋）
+    202601: 2025-2026学年第二学期（春）
+  term_alias:
+    - 上学期 / 今年春季 通常指 202601
+    - 去年秋季 通常指 202502
+  rate_unit: 所有 *_rate 字段都是【小数】（0.1048 表示 10.48%），不是百分数
+  sensitive_fields:
+    - 学生身份证号（id_card_hash / id_card_cipher）
+    - 学生手机号（phone_hash / phone_cipher）
+    - 教师手机号
+    - 涉及以上字段的查询一律返回 INSUFFICIENT_SCHEMA
+  notes:
+    - 指标口径已固化在 DWS/ADS 层，**不要从明细表（ODS/DWD）重新算**，直接用聚合表
+    - 同一指标在不同层可能口径不同，优先用 ADS 层（业务口径）
+
+# ---------------------------------------------------------------------
+# ADS 层（应用指标层）—— 优先使用
+# ---------------------------------------------------------------------
+tables:
+
+  ads_term_kpi:
+    cn: 学期 KPI 总览
+    grain: 每个学期一行（共 3 行）
+    use_for: 全校层面的学期汇总指标（均分、挂科率、出勤率、预警人数）
+    fields:
+      - {name: term_id,       type: int,          cn: 学期编码, enum_key: term_encoding}
+      - {name: term_name,     type: varchar(64),  cn: 学期中文名}
+      - {name: season,        type: varchar(8),   cn: 季节, enum: {春: 春季学期, 秋: 秋季学期}}
+      - {name: student_cnt,   type: int,          cn: 有选课记录的学生数}
+      - {name: select_cnt,    type: int,          cn: 选课人次（一个学生选一门课算一次）}
+      - {name: avg_select,    type: decimal,      cn: 人均选课门数}
+      - {name: avg_score,     type: decimal,      cn: 全校均分, caliber: 同一学生同一班次取【最高分】口径}
+      - {name: fail_rate,     type: decimal,      cn: 挂科率,   caliber: 【正考】成绩<60 的比例}
+      - {name: excellent_rate, type: decimal,     cn: 优良率,   caliber: 学生学期均分>=80 的比例}
+      - {name: avg_attend_rate, type: decimal,    cn: 平均出勤率, caliber: 出勤次数/有效考勤记录数}
+      - {name: risk_student_cnt, type: int,       cn: 预警学生数, caliber: 挂科>=2 门 或 折算缺勤>=8 次}
+    notes:
+      - avg_score（最高分口径）与 fail_rate（正考口径）口径不同，不能互相推导
+      - 想按学院/班级/课程拆分，用对应的 ads_college_kpi / dws_class_term / dws_course_term
+
+  ads_term_trend:
+    cn: 学期趋势
+    grain: 每个学期一行，按时间顺序
+    use_for: 多学期趋势对比（均分/挂科率/出勤率/预警率的变化）
+    fields:
+      - {name: term_id,    type: int,         cn: 学期编码, enum_key: term_encoding}
+      - {name: term_name,  type: varchar(64), cn: 学期中文名}
+      - {name: seq_no,     type: int,         cn: 时间顺序（1/2/3，按时间先后）}
+      - {name: student_cnt, type: int,        cn: 学生数}
+      - {name: avg_score,  type: decimal,     cn: 均分}
+      - {name: fail_rate,  type: decimal,     cn: 挂科率}
+      - {name: attend_rate, type: decimal,    cn: 出勤率}
+      - {name: risk_rate,  type: decimal,     cn: 预警率（预警人数/学生数）}
+    notes:
+      - 问"变化/趋势/涨跌"时用本表，按 seq_no 排序，不要用 term_id 排序
+
+  ads_college_kpi:
+    cn: 学院 KPI 对比
+    grain: 每学期 × 每学院一行（3 学期 × 12 学院 = 36 行）
+    use_for: 学院之间的横向对比与排名
+    fields:
+      - {name: term_id,        type: int,          cn: 学期编码, enum_key: term_encoding}
+      - {name: college_name,   type: varchar(100), cn: 学院名称, enum_hint: "如 计算机科学与工程学院、经济与管理学院、外国语学院"}
+      - {name: class_cnt,      type: int,          cn: 班级数}
+      - {name: student_cnt,    type: int,          cn: 学生数}
+      - {name: avg_score,      type: decimal,      cn: 学院均分}
+      - {name: fail_rate,      type: decimal,      cn: 挂科率}
+      - {name: avg_attend_rate, type: decimal,     cn: 平均出勤率}
+      - {name: risk_cnt,       type: int,          cn: 预警人数}
+      - {name: risk_rate,      type: decimal,      cn: 预警率}
+      - {name: rank_no,        type: int,          cn: 按均分排名（1 = 均分最高）}
+    notes:
+      - 问"哪个学院均分最高/最低"用 rank_no 或直接 ORDER BY avg_score
+
+  ads_course_fail_rank:
+    cn: 课程挂科率排行
+    grain: 每学期 × 每课程一行（3 学期 × 120 课程 = 360 行）
+    use_for: 找出挂科率高的课程（只含有成绩人数 >= 30 的课程）
+    fields:
+      - {name: term_id,         type: int,          cn: 学期编码, enum_key: term_encoding}
+      - {name: rank_no,         type: int,          cn: 该学期内的挂科率排名（1 = 挂科率最高）}
+      - {name: course_id,       type: int,          cn: 课程ID}
+      - {name: course_code,     type: varchar(32),  cn: 课程编码}
+      - {name: course_name,     type: varchar(100), cn: 课程名称, enum_hint: "如 电机学（上）、数据结构（上）、日语入门"}
+      - {name: course_type_name, type: varchar(16), cn: 课程类型（必修/选修）}
+      - {name: credit,          type: decimal,      cn: 学分}
+      - {name: scored_cnt,      type: int,          cn: 有成绩人数}
+      - {name: fail_cnt,        type: int,          cn: 挂科人数（正考<60）}
+      - {name: fail_rate,       type: decimal,      cn: 挂科率}
+      - {name: avg_score,       type: decimal,      cn: 课程均分}
+      - {name: attend_rate,     type: decimal,      cn: 课程出勤率}
+    notes:
+      - 这是"课程名"维度的表；想按"班次（教学班）"拆分需要 dws_course_term + 班次维度
+
+  ads_score_distribution:
+    cn: 成绩分段分布
+    grain: 每学期 × 每分数段一行（5 段 × 3 学期 = 15 行）
+    use_for: 成绩分布直方图、各分数段占比
+    fields:
+      - {name: term_id,    type: int,          cn: 学期编码, enum_key: term_encoding}
+      - {name: band_order, type: tinyint,      cn: 分段顺序（1 最高分到 5 最低分）}
+      - {name: band_name,  type: varchar(16),  cn: 分段名称, enum: {"90-100": 优秀, "80-89": 良好, "70-79": 中等, "60-69": 及格, "<60": 不及格}}
+      - {name: score_cnt,  type: int,          cn: 该分段人次}
+      - {name: ratio,      type: decimal,      cn: 该分段占比（0-1 小数）}
+    notes:
+      - 分段基于【正考】成绩
+      - 小于 60 分那一段就是不及格人次，可用于算不及格率
+
+  ads_student_risk:
+    cn: 学业预警名单
+    grain: 每学期 × 每个预警学生一行（约 9000 行）
+    use_for: 查具体学生的预警信息、按班级/学院筛预警名单
+    fields:
+      - {name: term_id,       type: int,          cn: 学期编码, enum_key: term_encoding}
+      - {name: student_id,    type: bigint,       cn: 学生ID}
+      - {name: student_no,    type: varchar(32),  cn: 学号, enum_hint: "形如 S000001"}
+      - {name: student_name,  type: varchar(64),  cn: 学生姓名}
+      - {name: class_name,    type: varchar(64),  cn: 班级名称, enum_hint: "如 计科一班、电子三班"}
+      - {name: major_name,    type: varchar(100), cn: 专业名称}
+      - {name: college_name,  type: varchar(100), cn: 学院名称}
+      - {name: select_cnt,    type: int,          cn: 选课门数}
+      - {name: scored_cnt,    type: int,          cn: 已出分门数}
+      - {name: fail_cnt,      type: int,          cn: 挂科门数}
+      - {name: avg_score,     type: decimal,      cn: 学生学期均分}
+      - {name: att_converted, type: int,          cn: 折算缺勤次数}
+      - {name: attend_rate,   type: decimal,      cn: 出勤率}
+      - {name: risk_level,    type: varchar(8),   cn: 风险等级, enum: {高风险: 挂科>=4 或 缺勤>=12, 中风险: 挂科>=2 或 缺勤>=8}}
+      - {name: risk_reason,   type: varchar(128), cn: 预警原因说明}
+    notes:
+      - 本表只包含"已命中预警规则"的学生，不是全部学生
+      - 查"某个学生是否预警"用本表；查"某学生全部成绩"用 dws_student_term
+
+  ads_teacher_workload:
+    cn: 教师工作量
+    grain: 每学期 × 每教师一行
+    use_for: 教师授课量、教学效果（均分/挂科率）
+    fields:
+      - {name: term_id,       type: int,         cn: 学期编码, enum_key: term_encoding}
+      - {name: teacher_id,    type: bigint,      cn: 教师ID}
+      - {name: teacher_name,  type: varchar(64), cn: 教师姓名}
+      - {name: title,         type: varchar(30), cn: 职称, enum: {教授: ~, 副教授: ~, 讲师: ~, 助教: ~}}
+      - {name: college_name,  type: varchar(100), cn: 所属学院}
+      - {name: schedule_cnt,  type: int,         cn: 授课班次数}
+      - {name: student_cnt,   type: int,         cn: 学生人次数}
+      - {name: avg_score,     type: decimal,     cn: 所授课程均分}
+      - {name: fail_rate,     type: decimal,     cn: 所授课程挂科率}
+      - {name: workload_level, type: varchar(8), cn: 工作量相对分档, enum: {重: 前1/3, 中: 中间1/3, 轻: 后1/3}}
+    notes:
+      - workload_level 是 NTILE(3) 相对分档，不等于绝对学生人数阈值
+
+  ads_attendance_weekly:
+    cn: 教学周到课率趋势
+    grain: 每学期 × 教学周一行（3 学期 × 4 周 = 12 行）
+    use_for: 按周看出勤率/旷课率的变化
+    fields:
+      - {name: term_id,     type: int,     cn: 学期编码, enum_key: term_encoding}
+      - {name: week_no,     type: tinyint, cn: 教学周序号（1-4）}
+      - {name: att_total,   type: int,     cn: 该周考勤记录数}
+      - {name: present_cnt, type: int,     cn: 出勤人次}
+      - {name: late_cnt,    type: int,     cn: 迟到人次}
+      - {name: early_cnt,   type: int,     cn: 早退人次}
+      - {name: leave_cnt,   type: int,     cn: 请假人次}
+      - {name: absent_cnt,  type: int,     cn: 旷课人次}
+      - {name: attend_rate, type: decimal, cn: 出勤率}
+      - {name: absent_rate, type: decimal, cn: 旷课率}
+    notes:
+      - 目前只造了 4 个教学周的考勤数据，week_no 范围 1-4
+
+# ---------------------------------------------------------------------
+# DWS 层（主题宽表）—— 需要按班级/课程/学生粒度时使用
+# ---------------------------------------------------------------------
+dws_tables:
+
+  dws_student_term:
+    cn: 学生学期汇总
+    grain: 每学期 × 每学生一行（约 6 万行）
+    use_for: 学生粒度的成绩、考勤、学分汇总
+    fields:
+      - {name: term_id,      type: int,          cn: 学期编码, enum_key: term_encoding}
+      - {name: student_id,   type: bigint,       cn: 学生ID}
+      - {name: student_no,   type: varchar(32),  cn: 学号}
+      - {name: student_name, type: varchar(64),  cn: 学生姓名}
+      - {name: class_id,     type: int,          cn: 班级ID}
+      - {name: class_name,   type: varchar(64),  cn: 班级名称}
+      - {name: major_name,   type: varchar(100), cn: 专业名称}
+      - {name: college_name, type: varchar(100), cn: 学院名称}
+      - {name: select_cnt,   type: int,          cn: 有效选课门数}
+      - {name: credit_sum,   type: decimal,      cn: 所选课程总学分}
+      - {name: scored_cnt,   type: int,          cn: 已出分门数}
+      - {name: avg_score,    type: decimal,      cn: 均分-最高分口径, caliber: 同一班次多次考试取最高分}
+      - {name: avg_first,    type: decimal,      cn: 均分-正考口径,   caliber: 只取正考成绩}
+      - {name: max_score,    type: decimal,      cn: 最高单科分}
+      - {name: min_score,    type: decimal,      cn: 最低单科分}
+      - {name: fail_cnt,     type: int,          cn: 正考挂科门数}
+      - {name: makeup_pass,  type: int,          cn: 补考通过门数}
+      - {name: pass_rate,    type: decimal,      cn: 正考通过率}
+      - {name: att_total,    type: int,          cn: 考勤记录数}
+      - {name: att_present,  type: int,          cn: 出勤次数}
+      - {name: att_late,     type: int,          cn: 迟到次数}
+      - {name: att_early,    type: int,          cn: 早退次数}
+      - {name: att_leave,    type: int,          cn: 请假次数}
+      - {name: att_absent,   type: int,          cn: 旷课次数}
+      - {name: att_converted, type: int,         cn: 折算缺勤次数, caliber: 旷课 + 迟到>30min + 早退>30min}
+      - {name: attend_rate,  type: decimal,      cn: 出勤率}
+      - {name: att_pass,     type: tinyint,      cn: 考勤是否合格（折算缺勤<=3 为 1）}
+    notes:
+      - 【重要】avg_score 是最高分口径、avg_first 是正考口径。问"平均分"默认用 avg_score
+      - 【重要】fail_cnt/pass_rate 用的是正考口径，与 avg_score 口径不一致
+
+  dws_class_term:
+    cn: 班级学期汇总
+    grain: 每学期 × 每班级一行（3 × 400 = 1200 行）
+    use_for: 班级层面对比、班级排名
+    fields:
+      - {name: term_id,         type: int,          cn: 学期编码, enum_key: term_encoding}
+      - {name: class_id,        type: int,          cn: 班级ID}
+      - {name: class_name,      type: varchar(64),  cn: 班级名称, enum_hint: "如 计科一班、软工二班、电子三班"}
+      - {name: major_name,      type: varchar(100), cn: 专业名称}
+      - {name: college_name,    type: varchar(100), cn: 学院名称}
+      - {name: enroll_year,     type: smallint,     cn: 入学年份}
+      - {name: student_cnt,     type: int,          cn: 班级人数}
+      - {name: avg_select,      type: decimal,      cn: 人均选课门数}
+      - {name: avg_score,       type: decimal,      cn: 班级均分}
+      - {name: fail_rate,       type: decimal,      cn: 班级挂科率}
+      - {name: avg_attend_rate, type: decimal,      cn: 平均出勤率}
+      - {name: risk_cnt,        type: int,          cn: 预警人数}
+    notes:
+      - class_name 在不同学院/年级可能重名，精确查询建议同时限定 college_name 或 enroll_year
+
+  dws_course_term:
+    cn: 课程学期汇总
+    grain: 每学期 × 每课程一行（3 × 120 = 360 行）
+    use_for: 课程的选课人数、均分、挂科率、出勤率
+    fields:
+      - {name: term_id,         type: int,          cn: 学期编码, enum_key: term_encoding}
+      - {name: course_id,       type: int,          cn: 课程ID}
+      - {name: course_code,     type: varchar(32),  cn: 课程编码}
+      - {name: course_name,     type: varchar(100), cn: 课程名称}
+      - {name: course_type_name, type: varchar(16), cn: 课程类型}
+      - {name: credit,          type: decimal,      cn: 学分}
+      - {name: select_cnt,      type: int,          cn: 选课人数}
+      - {name: scored_cnt,      type: int,          cn: 有成绩人数}
+      - {name: avg_score,       type: decimal,      cn: 课程均分}
+      - {name: fail_cnt,        type: int,          cn: 挂科人数（正考）}
+      - {name: fail_rate,       type: decimal,      cn: 挂科率}
+      - {name: excellent_cnt,   type: int,          cn: 优秀人数（>=90）}
+      - {name: excellent_rate,  type: decimal,      cn: 优秀率}
+      - {name: att_total,       type: int,          cn: 考勤记录数}
+      - {name: att_present,     type: int,          cn: 出勤人次}
+      - {name: attend_rate,     type: decimal,      cn: 课程出勤率}
+    notes:
+      - 与 ads_course_fail_rank 的区别：本表含全部课程（不筛样本量），且字段更全
+
+  dws_teacher_term:
+    cn: 教师学期汇总
+    grain: 每学期 × 每教师一行
+    use_for: 教师粒度的授课量与教学效果（不含分档）
+    fields:
+      - {name: term_id,      type: int,          cn: 学期编码, enum_key: term_encoding}
+      - {name: teacher_id,   type: bigint,       cn: 教师ID}
+      - {name: teacher_name, type: varchar(64),  cn: 教师姓名}
+      - {name: title,        type: varchar(30),  cn: 职称}
+      - {name: college_name, type: varchar(100), cn: 所属学院}
+      - {name: schedule_cnt, type: int,          cn: 授课班次数}
+      - {name: student_cnt,  type: int,          cn: 学生人次数}
+      - {name: avg_score,    type: decimal,      cn: 均分}
+      - {name: fail_rate,    type: decimal,      cn: 挂科率}
+    notes:
+      - 与 ads_teacher_workload 的区别：ads 版多一个 workload_level 相对分档
+
+# ---------------------------------------------------------------------
+# 表间关系（JOIN 提示）
+# ---------------------------------------------------------------------
+relations:
+  - {left: "dws_student_term.class_id", right: "dws_class_term.class_id", type: "N:1", note: "需同时匹配 term_id"}
+  - {left: "dws_student_term.term_id",  right: "dws_class_term.term_id",  type: "N:1"}
+  - {left: "ads_college_kpi.college_name", right: "dws_class_term.college_name", type: "N:1", note: "按学院名关联，字符串匹配"}
+  - {left: "ads_student_risk.student_no", right: "dws_student_term.student_no", type: "N:1", note: "需同时匹配 term_id"}
+  - {left: "ads_course_fail_rank.course_id", right: "dws_course_term.course_id", type: "N:1", note: "需同时匹配 term_id"}
